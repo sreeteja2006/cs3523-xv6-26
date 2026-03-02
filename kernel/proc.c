@@ -110,7 +110,7 @@ static struct proc*
 allocproc(void)
 {
   struct proc *p;
-
+  
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
@@ -120,8 +120,9 @@ allocproc(void)
     }
   }
   return 0;
-
-found:
+  
+  found:
+  p->syscount =0;
   p->pid = allocpid();
   p->state = USED;
 
@@ -268,6 +269,7 @@ kfork(void)
     return -1;
   }
 
+  np->syscount =0;
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);

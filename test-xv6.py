@@ -198,7 +198,7 @@ def test_usertests(test=""):
     q.cmd("usertests" + opt + "\n")
     q.monitor('^ALL TESTS PASSED', progress='test', timeout=timeout)
     q.stop()
-
+    
 def main():
     print(args)
     rex = r'%s' % args.testrex

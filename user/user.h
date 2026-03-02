@@ -47,3 +47,11 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
 // umalloc.c
 void* malloc(uint);
 void free(void*);
+
+//test
+void hello(void);
+int getpid2(void);
+int getppid(void);
+int getnumchild(void);
+int getsyscount(void);
+int getchildsyscount(uint64);

@@ -107,3 +107,78 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_hello(void)
+{
+  printf("Hello from the kernel!\n");
+  return 0;
+}
+
+uint64
+sys_getpid2(void)
+{
+  return myproc()->pid;
+}
+
+uint64
+sys_getppid(void)
+{
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  uint64 ppid = p->parent ? p->parent->pid : -1;
+  release(&p->lock);
+  return ppid;
+}
+
+
+uint64
+sys_getnumchild(void)
+{
+  struct proc *p = myproc();
+  int count = 0;
+  struct proc *proc_iter;
+
+  for(proc_iter = proc; proc_iter < &proc[NPROC]; proc_iter++) {
+    acquire(&proc_iter->lock);
+    if(proc_iter->parent == p && proc_iter->state != ZOMBIE  && proc_iter->state != UNUSED) {
+      count++;
+    }
+    release(&proc_iter->lock); 
+  }
+  return count;
+} 
+
+uint64
+sys_getsyscount(void)
+{
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  uint64 c = p->syscount;
+  release(&p->lock);
+  return c;
+}
+
+
+
+uint64
+sys_getchildsyscount(void)
+{
+  int chpid;
+  argint(0, &chpid);
+  if(chpid < 0)
+    return -1;
+
+  struct proc *p = myproc();
+
+  for(struct proc *q = proc; q < &proc[NPROC]; q++){
+    acquire(&q->lock);
+    if(q->parent == p && q->pid == chpid){
+      uint64 c = q->syscount;
+      release(&q->lock);
+      return c;
+    }
+    release(&q->lock);
+  }
+  return -1;
+}

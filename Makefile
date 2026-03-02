@@ -1,6 +1,6 @@
 K=kernel
 U=user
-
+T = test-progs
 OBJS = \
   $K/entry.o \
   $K/start.o \
@@ -145,6 +145,17 @@ UPROGS=\
 	$U/_logstress\
 	$U/_forphan\
 	$U/_dorphan\
+	$U/_hello_test\
+	$U/_getpid2_test\
+	$U/_getppid_test\
+	$U/_numchild_test\
+	$U/_getsyscount\
+	$U/_childsyscnt\
+	$U/_1\
+	$U/_2\
+	$U/_3\
+	$U/_4\
+
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
