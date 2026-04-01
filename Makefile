@@ -155,6 +155,13 @@ UPROGS=\
 	$U/_2\
 	$U/_3\
 	$U/_4\
+	$U/_mlfqtest\
+	$U/_swaptest\
+	$U/_A\
+	$U/_B\
+	$U/_C\
+	$U/_D\
+	$U/_E\
 
 
 fs.img: mkfs/mkfs README $(UPROGS)

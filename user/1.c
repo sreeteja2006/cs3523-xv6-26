@@ -1,23 +1,56 @@
 #include "kernel/types.h"
 #include "user/user.h"
 
+void cpu_bound()
+{
+    for(int i = 0; i < 200000000; i++);
+    for(int i = 0; i < 200000000; i++);
+    for(int i = 0; i < 200000000; i++);
+    for(int i = 0; i < 200000000; i++);
+    printf("[CPU] PID %d Level: %d\n", getpid(), getlevel());
+}
+
+void syscall_heavy()
+{
+    for(int i = 0; i < 200000; i++){
+        getpid();
+    }
+    printf("[SYSCALL] PID %d Level: %d\n", getpid(), getlevel());
+}
+
+void mixed()
+{
+    for(int i = 0; i < 500; i++){
+        for(int j = 0; j < 10000; j++);
+        getpid();
+    }
+    printf("[MIXED] PID %d Level: %d\n", getpid(), getlevel());
+}
+
 int
 main()
 {
-    printf("---- BASIC TEST ----\n");
+    printf("=== Test 1: Core Scheduling Behavior ===\n");
 
-    hello();
+    printf("Initial Level (parent): %d\n", getlevel());
 
-    int pid1 = getpid();
-    int pid2 = getpid2();
+    if(fork() == 0){
+        cpu_bound();
+        exit(0);
+    }
 
-    if(pid1 == pid2)
-        printf("getpid2() correct\n");
-    else
-        printf("getpid2() WRONG\n");
+    if(fork() == 0){
+        syscall_heavy();
+        exit(0);
+    }
 
-    int ppid = getppid();
-    printf("PID: %d  PPID: %d\n", pid1, ppid);
+    if(fork() == 0){
+        mixed();
+        exit(0);
+    }
+
+    for(int i = 0; i < 3; i++)
+        wait(0);
 
     exit(0);
 }

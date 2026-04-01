@@ -4,38 +4,37 @@
 int
 main()
 {
-    printf("---- CHILD TEST ----\n");
+    printf("=== Test 2: Priority Boost & Fairness ===\n");
 
-    // int parent = getpid();
+    for(int i = 0; i < 3; i++){
+        if(fork() == 0){
+            // Make them CPU heavy so they get demoted
+            for(int j = 0; j < 150000000; j++);
+            for(int j = 0; j < 150000000; j++);
+            for(int j = 0; j < 150000000; j++);
+            for(int j = 0; j < 150000000; j++);
 
-    int pid1 = fork();
-    if(pid1 == 0){
-        pause(10);
-        exit(0);
+            int lvl_before = getlevel();
+            printf("Child %d level BEFORE boost: %d\n", getpid(), lvl_before);
+
+            // Wait for boost (using pause)
+            for(int k = 0; k < 200; k++){
+                pause(1);
+            }
+
+            int lvl_after = getlevel();
+            printf("Child %d level AFTER boost: %d\n", getpid(), lvl_after);
+
+            if(lvl_after != 0){
+                printf("ERROR: Boost failed for PID %d\n", getpid());
+            }
+
+            exit(0);
+        }
     }
 
-    int pid2 = fork();
-    if(pid2 == 0){
-        pause(20);
-        exit(0);
-    }
-
-    pause(5);
-
-    int n = getnumchild();
-    printf("Number of children (expected 2): %d\n", n);
-
-    int sc = getchildsyscount(pid1);
-    printf("Child syscall count (valid child): %d\n", sc);
-
-    int invalid = getchildsyscount(9999);
-    printf("Invalid child syscall (expected -1): %d\n", invalid);
-
-    wait(0);
-    wait(0);
-
-    int n2 = getnumchild();
-    printf("Number of children after wait (expected 0): %d\n", n2);
+    for(int i = 0; i < 3; i++)
+        wait(0);
 
     exit(0);
 }
