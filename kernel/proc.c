@@ -333,7 +333,8 @@ int kfork(void)
     return -1;
   }
   np->sz = p->sz;
-  np->resident_pages = 0; // Child starts with no resident pages
+  np->resident_pages = p->resident_pages;
+  np->pages_swapped_out = p->pages_swapped_out;
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -792,21 +793,4 @@ int get_pagetable_level(pagetable_t pt)
   }
 
   return 0;
-}
-
-void increment_evictions(pagetable_t pt)
-{
-  struct proc *p;
-  for (p = proc; p < &proc[NPROC]; p++)
-  {
-    if (p->state != UNUSED && p->pagetable == pt)
-    {
-      acquire(&p->lock);
-      p->pages_evicted++;
-      p->pages_swapped_out++;
-      p->resident_pages--;
-      release(&p->lock);
-      break;
-    }
-  }
 }

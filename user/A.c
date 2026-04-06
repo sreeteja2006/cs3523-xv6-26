@@ -4,7 +4,7 @@
 
 int main(void)
 {
-    printf("=== TEST 1: getvmstats Syscall ==="
+    printf("=== TEST 1: getvmstats Syscall ===\n");
 
     struct vmstats st;
     int pid = getpid();

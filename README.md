@@ -8,7 +8,7 @@
 
 ## Introduction
 
-This assignment adds memory management to xv6. When memory fills up (64 pages max), extra pages get written to disk (swap). The system tracks memory stats like page faults, evictions, and swaps per process. There are 5 test programs to check that everything works.
+This project implements a demand-paging and swap-space management system in xv6. When physical memory fills up (capped at 64 frames), the kernel evicts old pages to a 120MB swap region on the disk using a Clock algorithm that favor keeping high-priority processes in memory. We also added a per-process accounting system for page faults and swaps, accessible via a new `getvmstats` syscall. There are test programs A through N to verify that everything works correctly.
 
 ---
 
@@ -24,7 +24,8 @@ This assignment adds memory management to xv6. When memory fills up (64 pages ma
 - **kernel/syscall.c**: Syscall routing
 - **kernel/sysproc.c**: getvmstats implementation
 - **user/user.h**: User-space syscall declaration
-- **user/A.c, B.c, C.c, D.c, E.c**: Test programs
+- **user/A.c to N.c**: Test programs and stress tests
+- **Makefile**: To include the new test programs in the build process
 
 ---
 
@@ -36,7 +37,8 @@ This assignment adds memory management to xv6. When memory fills up (64 pages ma
 struct frame_entry {
   uint64 va;           // Virtual address
   void *pa;            // Memory address
-  pagetable_t owner;   // Which process owns this page
+  pagetable_t owner;   // Which pagetable owns this page
+  struct proc *owner_proc; // Remember the exact process for stats
   int ref_bit;         // Was this page recently used?
   int in_use;          // Is this slot used?
 };
@@ -150,9 +152,9 @@ else if ((r_scause() == 15 || r_scause() == 13 || r_scause() == 12) &&
 
 **Fault Types**:
 
-- 12: Reading from invalid page
-- 13: Loading from invalid page  
-- 15: Storing to invalid page
+- 12: Instruction page fault (fetching from an invalid code page)
+- 13: Load page fault (reading from an invalid data page)
+- 15: Store page fault (writing to an invalid data page)
 
 When a fault happens:
 
@@ -163,9 +165,9 @@ When a fault happens:
 
 ## Part D: Lazy Allocation
 
-### How sbrk() Works
+### How sbrklazy() Works
 
-When user calls sbrk(size):
+When user calls sbrklazy(size) (or sbrk if configured for lazy allocation):
 
 1. Only say "you have that much memory"
 2. Don't actually allocate memory yet
@@ -200,11 +202,14 @@ The algorithm scans pages in a circle:
 
 1. **Start scanning** from where we left off last time
 2. **Check each page**:
-   - If it's been used recently (ref_bit=1): skip it, clear the bit
-   - If it hasn't been used (ref_bit=0): evict this one!
-3. **Prefer low priority processes**: Processes with low SC-MLFQ priority are evicted first
-4. **Write to disk** and mark memory slot as free
-5. **Update counters**: Mark page as swapped out
+   - The CPU sets the `PTE_A` bit in the page table when a page is accessed.
+   - If `PTE_A` is 1, we update our `ref_bit` and then clear `PTE_A` so we can detect future reuse.
+   - If `PTE_A` is 0 but our `ref_bit` is already 1, we clear the `ref_bit` and give it a second chance.
+   - If both `PTE_A` and `ref_bit` are 0, it's a victim! 
+3. **Skip Code Pages**: We skip pages with `PTE_X` (executable) set to avoid evicting the kernel or user binaries.
+4. **Prefer low priority processes**: Processes with low priority level (lower priority in SC-MLFQ) are evicted first.
+5. **Write to disk** and mark memory slot as free.
+6. **Update counters**: Mark page as swapped out and decrease resident count.
 
 ### How We Write to Disk
 
@@ -218,22 +223,19 @@ Disk space is located after regular memory. Each page gets saved at a fixed loca
 
 ### Update Counters After Eviction
 
-When a page is evicted:
+When a page is evicted, the counters need to be updated. Since `exec()` temporarily changes the `pagetable` pointer before freeing the old memory, iterating over the process table to find the owner can miss the process entirely and mess up `resident_pages`. 
+
+To fix this, `struct frame_entry` stores `owner_proc` directly. When evicting or freeing pages, we just use `owner_proc` to decrease the stats directly:
 
 ```c
-void increment_evictions(pagetable_t pt) {
-  struct proc *p;
-  for (p = proc; p < &proc[NPROC]; p++) {
-    if (p->state != UNUSED && p->pagetable == pt) {
-      acquire(&p->lock);
-      p->pages_evicted++;      // Count it
-      p->pages_swapped_out++;  // Count it
-      p->resident_pages--;     // Decrease resident count
-      release(&p->lock);
-      break;
-    }
+  struct proc *vp = best_victim->owner_proc;
+  if(vp && vp->state != ZOMBIE && vp->state != UNUSED) {
+     acquire(&vp->lock);
+     vp->pages_evicted++;
+     vp->pages_swapped_out++;
+     vp->resident_pages--;
+     release(&vp->lock);
   }
-}
 ```
 
 ---
@@ -290,7 +292,7 @@ if (pte != 0 && (*pte & PTE_V_SWAP)) {
 **Case 4: Fresh Allocation**
 
 ```c
-// Increment fault counter
+// Increment fault counter (zero-fill faults only)
 acquire(&p->lock);
 p->page_faults++;
 release(&p->lock);
@@ -342,7 +344,7 @@ return mem;
 
 ## Part H: Handling Race Conditions
 
-### The Problem
+### The Page Mapping Problem
 
 Two CPUs try to allocate the same page at the same time:
 
@@ -371,6 +373,24 @@ static int free_unmap_page(void *pa) {
 - `free_user_page()`: Used for pages being evicted (decrement everything)
 - `free_unmap_page()`: Used for pages that failed to map (only decrement frame count)
 
+### Eviction Race Condition
+
+There was a race condition in `alloc_user_page` where:
+
+1. Process A calls `evict_page()` and frees a frame
+2. A context switch happens
+3. Process B runs and steals that newly freed frame slot
+4. Process A comes back and panics because there are no free frames left
+
+**The Fix:**
+I changed it so `alloc_user_page` reserves the slot `in_use = 1` first. Then it can safely drop locks and evict without worrying about someone else stealing the slot.
+
+### The exec() Stats Bug
+During `exec()`, `proc_freepagetable` clears the old memory after `p->pagetable` is updated. This means iterating over processes to find `oldpagetable` fails, and `resident_pages` never goes down.
+
+**The Fix:**
+I stored `struct proc *owner_proc` in the frame table when allocating pages. This lets us reliably decrement `resident_pages` using the pointer, avoiding issues when `exec` swaps pointers around.
+
 ---
 
 ## Part I: Memory Organization
@@ -396,17 +416,7 @@ From memlayout.h:
 
 ---
 
-## Counter Semantics
 
-| Counter | Type | Range | When Incremented |
-|---------|------|-------|------------------|
-| page_faults | cumulative | 0+ | Fresh page alloc, swap-in restore |
-| pages_evicted | cumulative | 0+ | Page written to swap |
-| pages_swapped_in | cumulative | 0+ | Page restored from swap |
-| pages_swapped_out | cumulative | 0+ | Page written to swap (= pages_evicted) |
-| resident_pages | current | 0-64 | Process currently has N pages in memory |
-
----
 
 ## Synchronization
 
@@ -445,24 +455,7 @@ release(&p->lock);
 
 ---
 
-## Build & Run
 
-```bash
-cd /home/adios123/cs3523-xv6-26
-make -j4        # Build kernel + all tests
-make qemu        # Boot xv6
-
-# Inside xv6 shell:
-A              # Test getvmstats syscall
-B              # Test page faults + lazy allocation
-C              # Test eviction + clock algorithm  
-D              # Test swap correctness + data integrity
-E              # Test multi-process isolation
-```
-
-Each test prints `=== TEST [N]: PASS ===` on success or error details on failure.
-
----
 
 ## Acknowledgements
 

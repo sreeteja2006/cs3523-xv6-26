@@ -23,6 +23,7 @@ struct frame_entry
   uint64 va;
   void *pa;
   pagetable_t owner;
+  struct proc *owner_proc;
   int ref_bit;
   int in_use;
 };
@@ -51,33 +52,23 @@ void frametable_init(void)
 
 static int free_user_page(void *pa)
 {
-  pagetable_t owner_pt = 0;
-
   acquire(&frametable_lock);
   for (int i = 0; i < MAX_FRAMES; i++)
   {
     if (frame_table[i].in_use && frame_table[i].pa == pa)
     {
       frame_table[i].in_use = 0;
-      owner_pt = frame_table[i].owner;
+      struct proc *p = frame_table[i].owner_proc;
       active_user_pages--;
       release(&frametable_lock);
 
       kfree(pa);
 
-      struct proc *p;
-      for (p = proc; p < &proc[NPROC]; p++)
+      if (p && p->state != ZOMBIE && p->state != UNUSED)
       {
-        if (p->state != UNUSED && p->pagetable == owner_pt)
-        {
-          if (p->state != ZOMBIE)
-          {
-            acquire(&p->lock);
-            p->resident_pages--;
-            release(&p->lock);
-          }
-          break;
-        }
+        acquire(&p->lock);
+        p->resident_pages--;
+        release(&p->lock);
       }
       return 0;
     }
@@ -196,8 +187,10 @@ void evict_page(void)
   void *victim_pa = best_victim->pa;
   uint64 victim_va = best_victim->va;
   pagetable_t victim_owner = best_victim->owner;
+  struct proc *victim_vp = best_victim->owner_proc;
   best_victim->in_use = 0;
   best_victim->pa = 0;
+  active_user_pages--;
   clock_hand = (best_victim_idx + 1) % MAX_FRAMES;
 
   int swap_slot = -1;
@@ -209,87 +202,97 @@ void evict_page(void)
       break;
     }
   }
-  if (swap_slot == -1)
+  if (swap_slot == -1) {
+    release(&frametable_lock);
     panic("evict_page: no swap slots");
+  }
 
   memmove(swap_slot_addr(swap_slot), victim_pa, PGSIZE);
   swap_slot_usage[swap_slot] = 1;
-  release(&frametable_lock);
 
   pte_t *pte = walk(victim_owner, victim_va, 0);
-  if (pte == 0)
+  if (pte == 0) {
+    release(&frametable_lock);
     panic("evict_page: pte missing");
+  }
   uint flags = PTE_FLAGS(*pte) & ~PTE_V;
   *pte = PA2PTE(swap_slot * PGSIZE) | PTE_V_SWAP | flags;
-  increment_evictions(victim_owner);
+  
+  if (victim_vp && victim_vp->state != ZOMBIE && victim_vp->state != UNUSED) {
+     acquire(&victim_vp->lock);
+     victim_vp->pages_evicted++;
+     victim_vp->pages_swapped_out++;
+     victim_vp->resident_pages--;
+     release(&victim_vp->lock);
+  }
 
-  acquire(&frametable_lock);
-  active_user_pages--;
   release(&frametable_lock);
-
   kfree(victim_pa);
 }
 
 static void *alloc_user_page(pagetable_t pagetable, uint64 va)
 {
   void *pa;
-
-  acquire(&frametable_lock);
-
-  if (active_user_pages >= MAX_FRAMES)
-  {
-    release(&frametable_lock);
-    evict_page();
-    pa = kalloc();
-    if (pa == 0)
-      return 0;
-    acquire(&frametable_lock);
-    active_user_pages++;
+  struct proc *owner_proc = 0;
+  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
+    if (p->state != UNUSED && p->pagetable == pagetable) {
+      owner_proc = p;
+      break;
+    }
   }
-  else
+  if (!owner_proc) owner_proc = myproc();
+
+  for (;;)
   {
-    active_user_pages++;
-    release(&frametable_lock);
-    pa = kalloc();
-    if (pa == 0)
+    int reserved_slot = -1;
+
+    acquire(&frametable_lock);
+    if (active_user_pages >= MAX_FRAMES)
     {
+      release(&frametable_lock);
       evict_page();
+      continue;
+    }
+
+    for (int i = 0; i < MAX_FRAMES; i++)
+    {
+      if (!frame_table[i].in_use)
+      {
+        frame_table[i].in_use = 1;
+        active_user_pages++;
+        reserved_slot = i;
+        break;
+      }
+    }
+    release(&frametable_lock);
+
+    if (reserved_slot != -1)
+    {
       pa = kalloc();
       if (pa == 0)
       {
-        acquire(&frametable_lock);
-        active_user_pages--;
-        release(&frametable_lock);
-        return 0;
+        evict_page();
+        pa = kalloc();
+        if (pa == 0)
+        {
+          acquire(&frametable_lock);
+          frame_table[reserved_slot].in_use = 0;
+          active_user_pages--;
+          release(&frametable_lock);
+          return 0;
+        }
       }
-      acquire(&frametable_lock);
-      active_user_pages++;
-      release(&frametable_lock);
-    }
-    else
-    {
-      acquire(&frametable_lock);
-    }
-  }
 
-  for (int i = 0; i < MAX_FRAMES; i++)
-  {
-    if (!frame_table[i].in_use)
-    {
-      frame_table[i].va = va;
-      frame_table[i].pa = pa;
-      frame_table[i].owner = pagetable;
-      frame_table[i].ref_bit = 1;
-      frame_table[i].in_use = 1;
+      acquire(&frametable_lock);
+      frame_table[reserved_slot].va = va;
+      frame_table[reserved_slot].pa = pa;
+      frame_table[reserved_slot].owner = pagetable;
+      frame_table[reserved_slot].owner_proc = owner_proc;
+      frame_table[reserved_slot].ref_bit = 1;
       release(&frametable_lock);
       return pa;
     }
   }
-
-  active_user_pages--;
-  release(&frametable_lock);
-  kfree(pa);
-  panic("alloc_user_page: no free frame entry after eviction");
 }
 
 pagetable_t
@@ -548,7 +551,7 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       if (child_slot == -1)
         panic("uvmcopy: no free swap slots for child");
       memmove(swap_slot_addr(child_slot), swap_slot_addr(parent_slot), PGSIZE);
-      uint flags = PTE_FLAGS(*pte);
+      flags = PTE_FLAGS(*pte);
       pte_t *child_pte = walk(new, i, 1);
       *child_pte = PA2PTE(child_slot * PGSIZE) | flags;
       continue;

@@ -1,0 +1,7 @@
+set timeout 10
+spawn make qemu
+expect "\\$ "
+send "H\r"
+expect "\\$ "
+send "\x01x"
+expect eof

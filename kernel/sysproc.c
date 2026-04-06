@@ -68,29 +68,6 @@ sys_sbrk(void)
   return addr;
 }
 
-// uint64
-// sys_sbrk(void)
-// {
-//   int n;
-//   uint64 addr;
-
-//   argint(0, &n);
-//   addr = myproc()->sz;
-
-//   // Lazy Allocation: We just increase the size tracker, but we DO NOT
-//   // actually allocate any physical RAM (kalloc) here.
-//   if (n > 0)
-//   {
-//     myproc()->sz += n;
-//   }
-//   else if (n < 0)
-//   {
-//     // If n is negative, actually free the memory
-//     myproc()->sz = uvmdealloc(myproc()->pagetable, addr, addr + n);
-//   }
-
-//   return addr;
-// }
 
 uint64
 sys_pause(void)

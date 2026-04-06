@@ -8,7 +8,7 @@
 
 int main(void)
 {
-    printf("=== TEST 4: Swap Correctnes + Data Integtiry ==="
+    printf("=== TEST 4: Swap Correctnes + Data Integtiry ===\n");
 
     int pid = getpid();
     struct vmstats st0, st1;

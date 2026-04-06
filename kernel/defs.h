@@ -78,7 +78,6 @@ void panic(char *) __attribute__((noreturn));
 void printfinit(void);
 
 // proc.c
-void increment_evictions(pagetable_t);
 int cpuid(void);
 void kexit(int);
 int kfork(void);

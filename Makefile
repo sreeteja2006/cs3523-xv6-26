@@ -162,6 +162,18 @@ UPROGS=\
 	$U/_C\
 	$U/_D\
 	$U/_E\
+	$U/_F\
+	$U/_G\
+	$U/_H\
+	$U/_I\
+	$U/_J\
+	$U/_K\
+	$U/_L\
+	$U/_M\
+	$U/_N\
+
+	
+	
 
 
 fs.img: mkfs/mkfs README $(UPROGS)
@@ -211,3 +223,4 @@ check-qemu-version:
 		echo "ERROR: Need qemu version >= $(MIN_QEMU_VERSION)"; \
 		exit 1; \
 	fi
+

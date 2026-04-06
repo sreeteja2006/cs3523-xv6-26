@@ -103,7 +103,6 @@ usertrap(void)
   else if ((r_scause() == 15 || r_scause() == 13 || r_scause() == 12) &&
            vmfault(p->pagetable, r_stval(), 0) != 0)
   {
-    // p->page_faults++;
   }
   else
   {
