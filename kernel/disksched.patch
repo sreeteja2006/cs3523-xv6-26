@@ -1,0 +1,18 @@
+--- kernel/disksched.c
++++ kernel/disksched.c
+@@ -105,6 +105,7 @@
+ // Drain all pending requests from the queue.
+ void disksched_run(void)
+ {
++    int loops = 0;
+     for (;;)
+     {
+         acquire(&disksched.lock);
+@@ -113,6 +114,8 @@
+         if (done)
+             break;
+         run_one();
++        if (++loops % 100000 == 0)
++            printf("disksched_run infinite loop? count=%d in_flight=%d\n", disksched.count, disksched.in_flight);
+     }
+ }

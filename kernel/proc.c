@@ -13,6 +13,8 @@ struct proc *q[4][NPROC];
 
 int qh[4];
 int qt[4];
+int qcount[4];
+struct spinlock mlfq_lock;
 
 struct proc *initproc;
 
@@ -37,24 +39,50 @@ struct spinlock wait_lock;
 void enqueue(struct proc *p)
 {
   int l = p->level;
+
+  acquire(&mlfq_lock);
+  if (p->in_queue)
+  {
+    release(&mlfq_lock);
+    return;
+  }
+  if (qcount[l] >= NPROC)
+  {
+    release(&mlfq_lock);
+    panic("mlfq enqueue overflow");
+  }
+
   q[l][qt[l]] = p;
   qt[l] = (qt[l] + 1) % NPROC;
+  qcount[l]++;
+  p->in_queue = 1;
+  release(&mlfq_lock);
 }
 
 struct proc *dequeue(int l)
 {
-  if (qh[l] == qt[l])
+  acquire(&mlfq_lock);
+  if (qcount[l] == 0)
   {
+    release(&mlfq_lock);
     return 0;
   }
   struct proc *p = q[l][qh[l]];
   qh[l] = (qh[l] + 1) % NPROC;
+  qcount[l]--;
+  if (p)
+    p->in_queue = 0;
+  release(&mlfq_lock);
+
   return p;
 }
 
 int isEmpty(int l)
 {
-  return qh[l] == qt[l];
+  acquire(&mlfq_lock);
+  int result = (qcount[l] == 0);
+  release(&mlfq_lock);
+  return result;
 }
 void proc_mapstacks(pagetable_t kpgtbl)
 {
@@ -77,11 +105,19 @@ void procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&mlfq_lock, "mlfq");
+  for (int i = 0; i < 4; i++)
+  {
+    qh[i] = 0;
+    qt[i] = 0;
+    qcount[i] = 0;
+  }
   for (p = proc; p < &proc[NPROC]; p++)
   {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
     p->kstack = KSTACK((int)(p - proc));
+    p->in_queue = 0;
   }
 }
 
@@ -163,6 +199,7 @@ found:
   p->pages_swapped_in = 0;
   p->pages_swapped_out = 0;
   p->resident_pages = 0;
+  p->in_queue = 0;
   for (int i = 0; i < 4; i++)
   {
     p->ticks[i] = 0;
@@ -219,6 +256,7 @@ freeproc(struct proc *p)
   p->pages_swapped_in = 0;
   p->pages_swapped_out = 0;
   p->resident_pages = 0;
+  p->in_queue = 0;
   p->state = UNUSED;
 }
 
@@ -325,9 +363,19 @@ int kfork(void)
   }
 
   np->syscount = 0;
+
+  // MUST release np->lock before uvmcopy.
+  // uvmcopy can call swap_read_page / swap_write_page for swapped-out
+  // parent pages, which calls bread() which sleeps.  Sleeping while
+  // holding a spinlock causes "sched locks" panic (noff != 1 in sched).
+  // np is invisible to the scheduler until we set state=RUNNABLE below,
+  // so it is safe to drop the lock here.
+  release(&np->lock);
+
   // Copy user memory from parent to child.
   if (uvmcopy(p->pagetable, np->pagetable, p->sz) < 0)
   {
+    acquire(&np->lock);
     freeproc(np);
     release(&np->lock);
     return -1;
@@ -341,7 +389,6 @@ int kfork(void)
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
-
   // increment reference counts on open file descriptors.
   for (i = 0; i < NOFILE; i++)
     if (p->ofile[i])
@@ -352,7 +399,7 @@ int kfork(void)
 
   pid = np->pid;
 
-  release(&np->lock);
+  // (np->lock is NOT held here — released before uvmcopy)
 
   acquire(&wait_lock);
   np->parent = p;
@@ -454,17 +501,22 @@ int kwait(uint64 addr)
         {
           // Found one.
           pid = pp->pid;
-          // you can use the given function(either_copyout) instead of plain copyout
-          if (addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
-                                   sizeof(pp->xstate)) < 0)
-          {
-            release(&pp->lock);
-            release(&wait_lock);
-            return -1;
-          }
+          // Save xstate BEFORE freeproc zeroes it, then release all
+          // spinlocks before copyout.  copyout calls vmfault if the
+          // destination page (parent's user stack) is swapped out, which
+          // eventually calls bread/sleep.  sleep requires noff==1, but
+          // here we hold wait_lock + pp->lock (noff=2), so calling
+          // copyout with locks held would trigger "sched locks" panic.
+          int xstate = pp->xstate;
           freeproc(pp);
           release(&pp->lock);
           release(&wait_lock);
+          // Now noff==0: safe for vmfault / disk I/O inside copyout.
+          if (addr != 0 && copyout(p->pagetable, addr, (char *)&xstate,
+                                   sizeof(xstate)) < 0)
+          {
+            return -1;
+          }
           return pid;
         }
         release(&pp->lock);

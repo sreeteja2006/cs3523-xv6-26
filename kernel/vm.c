@@ -7,6 +7,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
 
 pagetable_t kernel_pagetable;
 int active_user_pages = 0;
@@ -16,7 +17,7 @@ extern char trampoline[];
 
 struct spinlock frametable_lock;
 #define MAX_FRAMES 64
-#define SWAP_SLOTS 4096
+struct sleeplock swap_lock;
 
 struct frame_entry
 {
@@ -27,27 +28,50 @@ struct frame_entry
   int ref_bit;
   int in_use;
 };
+#define BLOCKS_PER_PAGE (PGSIZE / BSIZE)
+#define SWAP_SLOTS (SWAP_DISK_BLOCKS / BLOCKS_PER_PAGE)
 
 static struct frame_entry frame_table[MAX_FRAMES];
 int swap_slot_usage[SWAP_SLOTS];
-
-static inline char *swap_slot_addr(int slot)
-{
-  return (char *)(USABLE_PHYSTOP + (uint64)slot * PGSIZE);
-}
+static int swap_slot_writing[SWAP_SLOTS];
+int swap_slot_raid_mode[SWAP_SLOTS];
 
 void frametable_init(void)
 {
   initlock(&frametable_lock, "frametable");
-
+  initsleeplock(&swap_lock, "swap");
   for (int i = 0; i < SWAP_SLOTS; i++)
+  {
     swap_slot_usage[i] = 0;
+    swap_slot_writing[i] = 0;
+  }
 
   for (int i = 0; i < MAX_FRAMES; i++)
   {
     frame_table[i].in_use = 0;
     frame_table[i].ref_bit = 0;
   }
+}
+
+// Write one page to disk swap slot `slot`.
+// Must be called without frametable_lock held.
+static void swap_write_page(int slot, void *pa)
+{
+  int mode = raid_get_mode();
+  swap_slot_raid_mode[slot] = mode;
+  int start = SWAP_START_BLOCK + slot * BLOCKS_PER_PAGE;
+  for (int i = 0; i < BLOCKS_PER_PAGE; i++)
+    disksched_submit(start + i, 1, (char *)pa + i * BSIZE, myproc(), mode);
+  disksched_run();
+}
+
+static void swap_read_page(int slot, void *pa)
+{
+  int mode = swap_slot_raid_mode[slot];
+  int start = SWAP_START_BLOCK + slot * BLOCKS_PER_PAGE;
+  for (int i = 0; i < BLOCKS_PER_PAGE; i++)
+    disksched_submit(start + i, 0, (char *)pa + i * BSIZE, myproc(), mode);
+  disksched_run();
 }
 
 static int free_user_page(void *pa)
@@ -117,23 +141,20 @@ void evict_page(void)
 
   struct frame_entry *best_victim = 0;
   int best_victim_idx = -1;
-  int highest_level_seen = -1;
+  int best_level = -1;
   static int clock_hand = 0;
-  int initial_clock_hand = clock_hand;
 
+  // Pass 1: clock sweep, clear ref=1 and prefer ref=0 pages.
   for (int i = 0; i < MAX_FRAMES; i++)
   {
-    int idx = (initial_clock_hand + i) % MAX_FRAMES;
+    int idx = (clock_hand + i) % MAX_FRAMES;
     struct frame_entry *fe = &frame_table[idx];
     if (!fe->in_use)
       continue;
 
     pte_t *pte = walk(fe->owner, fe->va, 0);
 
-    if (pte != 0 && (*pte & PTE_X))
-      continue;
-
-    if (pte != 0 && (*pte & PTE_A))
+    if (pte && (*pte & PTE_A))
     {
       fe->ref_bit = 1;
       *pte &= ~PTE_A;
@@ -142,13 +163,11 @@ void evict_page(void)
     if (fe->ref_bit == 0)
     {
       int lvl = get_pagetable_level(fe->owner);
-      if (lvl > highest_level_seen)
+      if (lvl > best_level)
       {
-        highest_level_seen = lvl;
         best_victim = fe;
         best_victim_idx = idx;
-        if (lvl == 3)
-          break;
+        best_level = lvl;
       }
     }
     else
@@ -157,23 +176,22 @@ void evict_page(void)
     }
   }
 
+  // Pass 2: if needed, pick among pages whose ref bit was just cleared.
   if (best_victim == 0)
   {
-    highest_level_seen = -1;
+    int highest = -1;
     for (int i = 0; i < MAX_FRAMES; i++)
     {
-      int idx = (initial_clock_hand + i) % MAX_FRAMES;
+      int idx = (clock_hand + i) % MAX_FRAMES;
       struct frame_entry *fe = &frame_table[idx];
-      if (!fe->in_use || fe->ref_bit != 0)
+      if (!fe->in_use)
         continue;
       int lvl = get_pagetable_level(fe->owner);
-      if (lvl > highest_level_seen)
+      if (lvl > highest)
       {
-        highest_level_seen = lvl;
+        highest = lvl;
         best_victim = fe;
         best_victim_idx = idx;
-        if (lvl == 3)
-          break;
       }
     }
   }
@@ -184,6 +202,8 @@ void evict_page(void)
     panic("evict_page: No evictable pages");
   }
 
+  clock_hand = (best_victim_idx + 1) % MAX_FRAMES;
+
   void *victim_pa = best_victim->pa;
   uint64 victim_va = best_victim->va;
   pagetable_t victim_owner = best_victim->owner;
@@ -191,7 +211,6 @@ void evict_page(void)
   best_victim->in_use = 0;
   best_victim->pa = 0;
   active_user_pages--;
-  clock_hand = (best_victim_idx + 1) % MAX_FRAMES;
 
   int swap_slot = -1;
   for (int i = 0; i < SWAP_SLOTS; i++)
@@ -199,34 +218,49 @@ void evict_page(void)
     if (swap_slot_usage[i] == 0)
     {
       swap_slot = i;
+      swap_slot_usage[i] = 1;
+      swap_slot_writing[i] = 1;
       break;
     }
   }
-  if (swap_slot == -1) {
+  if (swap_slot == -1)
+  {
     release(&frametable_lock);
-    panic("evict_page: no swap slots");
+    panic("evict_page: no disk swap slots");
   }
 
-  memmove(swap_slot_addr(swap_slot), victim_pa, PGSIZE);
-  swap_slot_usage[swap_slot] = 1;
-
   pte_t *pte = walk(victim_owner, victim_va, 0);
-  if (pte == 0) {
+  if (pte == 0)
+  {
     release(&frametable_lock);
     panic("evict_page: pte missing");
   }
   uint flags = PTE_FLAGS(*pte) & ~PTE_V;
   *pte = PA2PTE(swap_slot * PGSIZE) | PTE_V_SWAP | flags;
-  
-  if (victim_vp && victim_vp->state != ZOMBIE && victim_vp->state != UNUSED) {
-     acquire(&victim_vp->lock);
-     victim_vp->pages_evicted++;
-     victim_vp->pages_swapped_out++;
-     victim_vp->resident_pages--;
-     release(&victim_vp->lock);
-  }
 
   release(&frametable_lock);
+
+  if (victim_vp && victim_vp->state != ZOMBIE && victim_vp->state != UNUSED)
+  {
+    acquire(&victim_vp->lock);
+    victim_vp->pages_evicted++;
+    victim_vp->pages_swapped_out++;
+    victim_vp->resident_pages--;
+    release(&victim_vp->lock);
+  }
+
+  int mode = raid_get_mode();
+  swap_slot_raid_mode[swap_slot] = mode;
+  int start = SWAP_START_BLOCK + swap_slot * BLOCKS_PER_PAGE;
+  for (int i = 0; i < BLOCKS_PER_PAGE; i++)
+    disksched_submit(start + i, 1, (char *)victim_pa + i * BSIZE,
+                     myproc(), mode);
+  disksched_run();
+
+  acquire(&frametable_lock);
+  swap_slot_writing[swap_slot] = 0;
+  release(&frametable_lock);
+
   kfree(victim_pa);
 }
 
@@ -234,13 +268,16 @@ static void *alloc_user_page(pagetable_t pagetable, uint64 va)
 {
   void *pa;
   struct proc *owner_proc = 0;
-  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
-    if (p->state != UNUSED && p->pagetable == pagetable) {
+  for (struct proc *p = proc; p < &proc[NPROC]; p++)
+  {
+    if (p->state != UNUSED && p->pagetable == pagetable)
+    {
       owner_proc = p;
       break;
     }
   }
-  if (!owner_proc) owner_proc = myproc();
+  if (!owner_proc)
+    owner_proc = myproc();
 
   for (;;)
   {
@@ -434,7 +471,9 @@ void uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       if (do_free)
       {
         int slot = PTE2PA(*pte) / PGSIZE;
+        acquire(&frametable_lock);
         swap_slot_usage[slot] = 0;
+        release(&frametable_lock);
       }
       *pte = 0;
       continue;
@@ -539,6 +578,7 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     {
       int parent_slot = PTE2PA(*pte) / PGSIZE;
       int child_slot = -1;
+      acquire(&frametable_lock);
       for (int j = 0; j < SWAP_SLOTS; j++)
       {
         if (swap_slot_usage[j] == 0)
@@ -548,9 +588,17 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
           break;
         }
       }
+      release(&frametable_lock);
       if (child_slot == -1)
         panic("uvmcopy: no free swap slots for child");
-      memmove(swap_slot_addr(child_slot), swap_slot_addr(parent_slot), PGSIZE);
+
+      char *tmp = kalloc();
+      if (tmp == 0)
+        goto err;
+      swap_read_page(parent_slot, tmp); // read parent's disk slot into RAM
+      swap_write_page(child_slot, tmp); // write to child's disk slot
+      kfree(tmp);
+
       flags = PTE_FLAGS(*pte);
       pte_t *child_pte = walk(new, i, 1);
       *child_pte = PA2PTE(child_slot * PGSIZE) | flags;
@@ -563,7 +611,19 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     flags = PTE_FLAGS(*pte);
     if ((mem = alloc_user_page(new, i)) == 0)
       goto err;
-    memmove(mem, (char *)pa, PGSIZE);
+
+    acquire(&frametable_lock);
+    if (*pte & PTE_V_SWAP)
+    {
+      int swap_slot = PTE2PA(*pte) / PGSIZE;
+      release(&frametable_lock);
+      swap_read_page(swap_slot, mem);
+    }
+    else
+    {
+      memmove(mem, (char *)pa, PGSIZE);
+      release(&frametable_lock);
+    }
     if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0)
     {
       free_user_page(mem);
@@ -654,7 +714,10 @@ int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
     if (pa0 == 0)
-      return -1;
+    {
+      if ((pa0 = vmfault(pagetable, va0, 0)) == 0)
+        return -1;
+    }
     n = PGSIZE - (srcva - va0);
     if (n > max)
       n = max;
@@ -698,16 +761,45 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 
   if (pte != 0 && (*pte & PTE_V_SWAP))
   {
+  retry_swapin:
+    acquiresleep(&swap_lock);
+
+    pte = walk(pagetable, va, 0);
+    if (pte == 0 || !(*pte & PTE_V_SWAP))
+    {
+      uint64 cur = (pte && (*pte & PTE_V)) ? PTE2PA(*pte) : 0;
+      releasesleep(&swap_lock);
+      return cur;
+    }
+
     int swap_slot = PTE2PA(*pte) / PGSIZE;
     uint flags = PTE_FLAGS(*pte) & ~PTE_V_SWAP;
 
+    acquire(&frametable_lock);
+    int writing = swap_slot_writing[swap_slot];
+    release(&frametable_lock);
+    if (writing)
+    {
+      releasesleep(&swap_lock);
+      yield();
+      goto retry_swapin;
+    }
+
     void *new_pa = alloc_user_page(pagetable, va);
     if (new_pa == 0)
+    {
+      releasesleep(&swap_lock);
       return 0;
+    }
 
-    memmove(new_pa, swap_slot_addr(swap_slot), PGSIZE);
+    swap_read_page(swap_slot, new_pa);
+
     *pte = PA2PTE((uint64)new_pa) | flags | PTE_V;
+    acquire(&frametable_lock);
     swap_slot_usage[swap_slot] = 0;
+    release(&frametable_lock);
+
+    releasesleep(&swap_lock);
 
     acquire(&p->lock);
     p->resident_pages++;

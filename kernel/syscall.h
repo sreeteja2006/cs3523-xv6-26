@@ -31,3 +31,7 @@
 #define SYS_getlevel 30
 #define SYS_getmlfqinfo 31
 #define SYS_getvmstats 32
+#define SYS_setdisksched 33
+#define SYS_setraidmode 34
+#define SYS_faildisk 35
+#define SYS_recovereddisk 36

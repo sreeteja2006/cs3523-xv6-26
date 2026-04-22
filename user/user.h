@@ -57,3 +57,7 @@ int getchildsyscount(uint64);
 int getlevel(void);
 int getmlfqinfo(int, struct mlfqinfo *);
 int getvmstats(int, struct vmstats *);
+int setdisksched(int);
+int setraidmode(int);
+int faildisk(int disk);
+int recovereddisk(int disk);

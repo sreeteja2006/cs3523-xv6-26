@@ -1,48 +1,345 @@
-xv6 is a re-implementation of Dennis Ritchie's and Ken Thompson's Unix
-Version 6 (v6).  xv6 loosely follows the structure and style of v6,
-but is implemented for a modern RISC-V multiprocessor using ANSI C.
+# Programming Assignment 04
+## Disk Scheduling and RAID-backed Swap in xv6
 
-ACKNOWLEDGMENTS
+Course: CS3523 - Operating Systems II (Spring 2026)  
+Instructor: Abhijit Das  
+Institute: IIT Hyderabad
 
-xv6 is inspired by John Lions's Commentary on UNIX 6th Edition (Peer
-to Peer Communications; ISBN: 1-57398-013-7; 1st edition (June 14,
-2000)).  See also https://pdos.csail.mit.edu/6.1810/, which provides
-pointers to on-line resources for v6.
+---
 
-The following people have made contributions: Russ Cox (context switching,
-locking), Cliff Frey (MP), Xiao Yu (MP), Nickolai Zeldovich, and Austin
-Clements.
+# 1. Introduction
 
-We are also grateful for the bug reports and patches contributed by
-Abhinavpatel00, Takahiro Aoyagi, Marcelo Arroyo, Hirbod Behnam, Silas
-Boyd-Wickizer, Anton Burtsev, carlclone, Ian Chen, clivezeng, Dan
-Cross, Cody Cutler, Mike CAT, Tej Chajed, Asami Doi,Wenyang Duan,
-echtwerner, eyalz800, Nelson Elhage, Saar Ettinger, Alice Ferrazzi,
-Nathaniel Filardo, flespark, Peter Froehlich, Yakir Goaron, Shivam
-Handa, Matt Harvey, Bryan Henry, jaichenhengjie, Jim Huang, Matúš
-Jókay, John Jolly, Alexander Kapshuk, Anders Kaseorg, kehao95,
-Wolfgang Keller, Jungwoo Kim, Jonathan Kimmitt, Eddie Kohler, Vadim
-Kolontsov, Austin Liew, l0stman, Pavan Maddamsetti, Imbar Marinescu,
-Yandong Mao, Matan Shabtay, Hitoshi Mitake, Carmi Merimovich,
-mes900903, Mark Morrissey, mtasm, Joel Nider, Hayato Ohhashi,
-OptimisticSide, papparapa, phosphagos, Harry Porter, Greg Price, Zheng
-qhuo, Quancheng, RayAndrew, Jude Rich, segfault, Ayan Shafqat, Eldar
-Sehayek, Yongming Shen, Fumiya Shigemitsu, snoire, Taojie, Cam Tenny,
-tyfkda, Warren Toomey, Stephen Tu, Alissa Tung, Rafael Ubal, unicornx,
-Amane Uehara, Pablo Ventura, Luc Videau, Xi Wang, WaheedHafez, Keiichi
-Watanabe, Lucas Wolf, Nicolas Wolovick, wxdao, Grant Wu, x653, Andy
-Zhang, Jindong Zhang, Icenowy Zheng, ZhUyU1997, and Zou Chang Wei.
+In PA3, swapped pages stayed in memory. In PA4, they are stored on disk.
 
-ERROR REPORTS
+I added two layers between VM and disk:
 
-Please send errors and suggestions to Frans Kaashoek and Robert Morris
-(kaashoek,rtm@mit.edu).  The main purpose of xv6 is as a teaching
-operating system for MIT's 6.1810, so we are more interested in
-simplifications and clarifications than new features.
+- a disk scheduler (FCFS and SSTF)
+- a RAID-backed block mapping layer (RAID 0, RAID 1, RAID 5)
 
-BUILDING AND RUNNING XV6
+When a page is evicted, it goes to disk through the scheduler and RAID.
+When it is needed again, it comes back through the same path.
 
-You will need a RISC-V "newlib" tool chain from
-https://github.com/riscv/riscv-gnu-toolchain, and qemu compiled for
-riscv64-softmmu.  Once they are installed, and in your shell
-search path, you can run "make qemu".
+Swap storage is split by RAID mode, so mode switches do not overwrite older
+pages.
+
+The kernel also tracks disk and swap stats through getvmstats().
+
+---
+
+# 2. High-Level Design
+
+## 2.1 End-to-End Swap Path
+
+Swap-out flow:
+
+1. VM picks a victim frame in kernel/vm.c.
+2. The page gets a swap slot.
+3. Its PTE changes from PTE_V to PTE_V_SWAP.
+4. One page is split into 4 blocks.
+5. Each block is sent to disksched_submit().
+6. The scheduler orders requests with FCFS or SSTF.
+7. Each request goes to raid_write().
+8. RAID maps the block into the right swap region and disk block.
+9. After all 4 blocks finish, the page is evicted and the frame is freed.
+
+Swap-in flow:
+
+1. vmfault() sees PTE_V_SWAP.
+2. A new physical frame is allocated.
+3. VM finds the saved swap slot and RAID mode.
+4. Four read requests go through disksched_submit().
+5. The scheduler orders them and calls raid_read().
+6. RAID reads or rebuilds the block data and copies it to memory.
+7. VM restores a normal valid PTE.
+8. The swap slot is freed.
+
+## 2.2 Replacement Policy Integration
+
+The eviction policy uses a clock-style ref-bit scan.
+It also uses PA2 scheduling priority.
+
+- Recently accessed pages get a second chance.
+- If several pages qualify, lower-priority processes are evicted first.
+
+This keeps the PA2 behavior while adding disk-backed swap.
+
+---
+
+# 3. Kernel Modifications
+
+## 3.1 VM and Swap Logic (kernel/vm.c)
+
+Main VM changes:
+
+- Swap slot tracking:
+  - swap_slot_usage[]
+  - swap_slot_writing[]
+  - swap_slot_raid_mode[]
+- Per-page disk transfer helpers:
+  - swap_write_page()
+  - swap_read_page()
+- Eviction writes pages to disk-backed swap blocks.
+- vmfault() reads pages back from disk.
+- A sleeplock keeps two CPUs from swapping in the same page at once.
+
+Swap region configuration comes from kernel/param.h:
+
+- SWAP_START_BLOCK
+- SWAP_DISK_BLOCKS
+- NDISK
+
+The RAID layer in kernel/raid.c also splits the swap region by RAID mode, so
+RAID 0, RAID 1, and RAID 5 do not reuse the same backing blocks.
+
+## 3.2 Disk Scheduler (kernel/disksched.c, kernel/disksched.h)
+
+Implemented a disk-request queue with a runtime-selectable policy:
+
+- FCFS (policy 0)
+- SSTF (policy 1)
+
+Scheduler keeps:
+
+- current disk head position
+- total latency
+- total read count
+- total write count
+- average latency
+
+Latency model:
+
+latency = abs(current_block - requested_block) + ROTATIONAL_DELAY
+
+Request selection:
+
+- First, FCFS or SSTF is applied.
+- Then process priority is used when needed, such as SSTF ties.
+
+So request order is not just arrival order; process priority can change which
+request reaches RAID first.
+
+## 3.3 RAID Layer (kernel/raid.c)
+
+Implemented three RAID modes over 4 simulated disks:
+
+- RAID 0:
+  - blocks are striped across disks
+  - no redundancy
+- RAID 1:
+  - each block is written to a mirror pair
+  - reads can use either healthy copy
+- RAID 5:
+  - data is striped and parity is distributed
+  - if one disk fails, missing data is rebuilt with XOR
+  - writes update both data and parity
+
+Swap backing is mode-aware: each RAID mode uses its own physical region, so
+mode switches do not clobber earlier swapped pages.
+
+Failure simulation support:
+
+- faildisk(int disk)
+- recovereddisk(int disk)
+
+These are used by PA4 failure-recovery tests.
+
+## 3.4 Syscall Wiring and Statistics
+
+Syscall routing goes through:
+
+- kernel/syscall.h
+- kernel/syscall.c
+- kernel/sysproc.c
+- user/usys.S
+- user/user.h
+
+getvmstats() now includes disk scheduler metrics along with the PA3 VM fields.
+
+---
+
+# 4. System Calls
+
+## 4.1 setdisksched
+
+int setdisksched(int policy)
+
+- policy = 0: FCFS
+- policy = 1: SSTF
+- returns 0 on success, -1 on invalid policy
+
+## 4.2 setraidmode
+
+int setraidmode(int mode)
+
+- mode = 0: RAID 0
+- mode = 1: RAID 1
+- mode = 5: RAID 5
+- returns 0 on success, -1 on invalid mode
+
+## 4.3 faildisk and recovereddisk
+
+int faildisk(int disk)  
+int recovereddisk(int disk)
+
+- toggles simulated disk health for RAID testing
+
+## 4.4 getvmstats
+
+int getvmstats(int pid, struct vmstats *info)
+
+Current vmstats fields:
+
+- page_faults
+- pages_evicted
+- pages_swapped_in
+- pages_swapped_out
+- resident_pages
+- disk_reads
+- disk_writes
+- avg_disk_latency
+
+How these numbers are produced:
+
+- page_faults/resident/swap counters are maintained in VM paths.
+- disk_reads/disk_writes/avg_disk_latency are maintained in scheduler paths.
+- getvmstats() combines them into one struct and copies it to user space.
+
+---
+
+# 5. Files Modified
+
+## Core kernel files
+
+- kernel/vm.c
+- kernel/disksched.c
+- kernel/disksched.h
+- kernel/raid.c
+- kernel/main.c
+- kernel/sysproc.c
+- kernel/syscall.c
+- kernel/syscall.h
+- kernel/defs.h
+- kernel/types.h
+- kernel/param.h
+
+## User-space interface files
+
+- user/user.h
+- user/usys.pl (generates user/usys.S)
+
+## PA4 user test programs
+
+- user/H.c to user/T.c
+
+---
+
+# 6. Experimental Validation
+
+H through N are the PA3 tests.
+O through T are the PA4 tests.
+
+## 6.1 VM and Replacement Baseline
+
+- H: basic page-fault and vmstats sanity
+- I: reference-bit behavior under pressure
+- J: replacement and swap-in correctness
+- K: scheduler-aware behavior under mixed priorities
+- L: repeated swap stress with integrity checks
+- M: vmstats syscall correctness/isolation
+- N: forced eviction beyond frame limit
+
+## 6.2 PA4-Specific Disk and RAID Tests
+
+- O: strict syscall validation for setdisksched/setraidmode
+- P: full-page byte integrity in RAID 0/1/5, including mode switching
+- Q: exact eviction boundary checks
+- R: fork correctness with swapped-out pages
+- S: repeated evict/restore cycle correctness
+- T: disk failure and recovery behavior (RAID 1 and RAID 5)
+
+## 6.3 Running Tests
+
+Build and run:
+
+make qemu
+
+Inside xv6 shell, run tests one by one:
+
+H
+I
+J
+K
+L
+M
+N
+O
+P
+Q
+R
+S
+T
+
+Automation helper:
+
+- run_tests.py currently runs H through N.
+- O through T are the PA4 disk and RAID checks.
+
+Data-flow behavior validated by tests:
+
+- Swap-out path validation:
+  tests N and Q show evictions and swapped_out increasing under pressure.
+- Swap-in path validation:
+  tests L, N, and S show data survives and swapped_in increases on re-access.
+- Scheduler path validation:
+  test O switches FCFS and SSTF.
+- RAID path validation:
+  tests P and T check integrity and recovery across RAID modes and disk failures.
+
+---
+
+# 7. Design Decisions and Assumptions
+
+## Design Decisions
+
+- Swap pages are transferred in page-sized chunks as 4 disk blocks.
+- Disk scheduling stays as a separate queue layer, so policy behavior is easy
+  to observe.
+- Swap slots record the RAID mode at write time, so swap-in uses the same
+  mapping even after a mode change.
+- Scheduler awareness is kept by using process level information from PA2.
+
+## Assumptions
+
+- RAID 1 and RAID 5 tests expect one failed disk.
+- Multiple disk failures may panic in RAID 5 paths.
+- Average latency is computed over completed scheduler requests.
+
+---
+
+# 8. Summary
+
+This PA4 implementation adds:
+
+- disk-backed swap
+- configurable disk scheduling (FCFS/SSTF)
+- RAID-backed swap mapping (0/1/5)
+- failure simulation support
+- extended VM + disk statistics
+
+The result is a full data path for swapped pages:
+
+VM page -> scheduler queue -> RAID mapping -> disk
+
+and back:
+
+disk -> RAID read/reconstruct -> scheduler completion -> VM remap.
+
+The O-T test suite checks this path for correctness, performance, and fault
+handling.
+
+---
+
+# Acknowledgements
+
+I used xv6 documentation, course material, and debugging tools while building
+and testing this assignment.

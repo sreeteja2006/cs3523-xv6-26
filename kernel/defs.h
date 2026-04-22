@@ -185,3 +185,19 @@ void virtio_disk_intr(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x) / sizeof((x)[0]))
+
+// disksched.c
+void disksched_init(void);
+void disksched_submit(int, int, void *, struct proc *, int);
+void disksched_run(void);
+int disksched_get_policy(void);
+void disksched_set_policy(int);
+uint64 disksched_avg_latency(void);
+
+// raid.c
+void raid_read(int, void *, int);
+void raid_write(int, void *, int);
+void raid_set_mode(int);
+int raid_get_mode(void);
+void faildisk(int);
+void recovereddisk(int);

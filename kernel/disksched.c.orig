@@ -1,0 +1,204 @@
+#include "types.h"
+#include "param.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "riscv.h"
+#include "defs.h"
+#include "fs.h"
+#include "buf.h"
+#include "proc.h"
+#include "disksched.h"
+
+struct
+{
+    struct disk_request requests[MAX_DISK_REQUESTS];
+    int count;
+    int policy;
+    struct spinlock lock;
+    int head;
+    uint64 total_latency;
+    uint64 total_requests;
+    int in_flight;
+} disksched;
+
+void disksched_init(void)
+{
+    initlock(&disksched.lock, "disksched");
+    disksched.count = 0;
+    disksched.policy = DISK_SCHED_FCFS;
+    disksched.head = 0;
+    disksched.total_latency = 0;
+    disksched.total_requests = 0;
+    disksched.in_flight = 0;
+    for (int i = 0; i < MAX_DISK_REQUESTS; i++)
+        disksched.requests[i].valid = 0;
+}
+
+// Pick the next request to service based on the scheduling policy.
+// Must be called with disksched.lock held.
+static int pick_next(void)
+{
+    if (disksched.count == 0)
+        return -1;
+
+    if (disksched.policy == DISK_SCHED_FCFS)
+    {
+        // Pick the first valid request (oldest submitted)
+        for (int i = 0; i < MAX_DISK_REQUESTS; i++)
+        {
+            if (disksched.requests[i].valid)
+                return i;
+        }
+    }
+
+    // SSTF: pick the valid request with the shortest seek distance from head
+    int best = -1;
+    int best_dist = 0x7fffffff;
+    for (int i = 0; i < MAX_DISK_REQUESTS; i++)
+    {
+        if (!disksched.requests[i].valid)
+            continue;
+        int dist = disksched.requests[i].blockno - disksched.head;
+        if (dist < 0)
+            dist = -dist;
+        if (dist < best_dist)
+        {
+            best_dist = dist;
+            best = i;
+        }
+    }
+    return best;
+}
+
+// Execute exactly one disk request from the queue.
+// Must be called WITHOUT disksched.lock held (bread/bwrite sleep).
+static void run_one(void)
+{
+    acquire(&disksched.lock);
+    if (disksched.count == 0)
+    {
+        release(&disksched.lock);
+        return;
+    }
+    int pick = pick_next();
+    if (pick < 0)
+    {
+        release(&disksched.lock);
+        return;
+    }
+    struct disk_request req = disksched.requests[pick];
+    disksched.requests[pick].valid = 0;
+    disksched.count--;
+    disksched.in_flight++;
+
+    int dist = req.blockno - disksched.head;
+    if (dist < 0)
+        dist = -dist;
+    disksched.head = req.blockno;
+    disksched.total_latency += dist + ROTATIONAL_DELAY;
+    disksched.total_requests++;
+    release(&disksched.lock);
+
+    // Do disk I/O without any global lock — bread/bwrite protect per-buffer.
+    if (req.write)
+        raid_write(req.blockno, req.data, req.mode);
+    else
+        raid_read(req.blockno, req.data, req.mode);
+
+    acquire(&disksched.lock);
+    disksched.in_flight--;
+    release(&disksched.lock);
+} 
+
+// Submit a single disk block request and immediately service one request
+// from the queue (which may be this one or a previously queued one).
+// blockno: the disk block number to read/write
+// write:   1 = write to disk, 0 = read from disk
+// data:    pointer to exactly BSIZE bytes of kernel memory
+// owner:   the process issuing the request (may be 0 for kernel)
+void disksched_submit(int blockno, int write, void *data, struct proc *owner, int mode)
+{
+    acquire(&disksched.lock);
+    if (disksched.count == MAX_DISK_REQUESTS)
+    {
+        release(&disksched.lock);
+        panic("disksched: queue full");
+    }
+
+    // Find an empty slot
+    int idx = -1;
+    for (int i = 0; i < MAX_DISK_REQUESTS; i++)
+    {
+        if (!disksched.requests[i].valid)
+        {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == -1)
+    {
+        release(&disksched.lock);
+        panic("disksched: no empty slot");
+    }
+
+    disksched.requests[idx].blockno = blockno;
+    disksched.requests[idx].write = write;
+    disksched.requests[idx].data = data;
+    disksched.requests[idx].owner = owner;
+    disksched.requests[idx].done = 0;
+    disksched.requests[idx].valid = 1;
+    disksched.requests[idx].mode = mode;
+    disksched.count++;
+    release(&disksched.lock);
+
+    // Service one request from the queue (schedules + executes)
+    run_one();
+}
+
+// Drain all pending requests from the queue.
+// Can be called from a background process to catch up on queued I/O.
+void disksched_run(void)
+{
+    for (;;)
+    {
+        acquire(&disksched.lock);
+        int done = (disksched.count == 0 && disksched.in_flight == 0);
+        release(&disksched.lock);
+        if (done)
+            break;
+        run_one();
+    }
+}
+
+int disksched_get_policy(void)
+{
+    return disksched.policy;
+}
+
+void disksched_set_policy(int policy)
+{
+    acquire(&disksched.lock);
+    disksched.policy = policy;
+    release(&disksched.lock);
+}
+
+uint64 disksched_avg_latency(void)
+{
+    if (disksched.total_requests == 0)
+        return 0;
+    return disksched.total_latency / disksched.total_requests;
+}
+
+// Syscall handler: setdisksched(int policy)
+// policy 0 = FCFS, 1 = SSTF
+// Returns 0 on success, -1 on invalid policy.
+int sys_setdisksched(void)
+{
+    int policy;
+    argint(0, &policy);
+    if (policy != DISK_SCHED_FCFS && policy != DISK_SCHED_SSTF)
+        return -1;
+    disksched_set_policy(policy);
+    return 0;
+}
+

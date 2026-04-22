@@ -128,6 +128,7 @@ struct proc
   int pages_swapped_in;
   int pages_swapped_out;
   int resident_pages;
+  int in_queue;
 };
 
 extern struct proc proc[NPROC];

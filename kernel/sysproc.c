@@ -6,6 +6,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "vm.h"
+#include "disksched.h"
 
 uint64
 sys_exit(void)
@@ -256,6 +257,9 @@ sys_getvmstats(void)
       info.pages_swapped_in = p->pages_swapped_in;
       info.pages_swapped_out = p->pages_swapped_out;
       info.resident_pages = p->resident_pages;
+      info.disk_reads = disksched_get_reads();
+      info.disk_writes = disksched_get_writes();
+      info.avg_disk_latency = disksched_avg_latency();
       release(&p->lock);
 
       if (copyout(myproc()->pagetable, uaddr, (char *)&info, sizeof(info)) < 0)
@@ -267,4 +271,34 @@ sys_getvmstats(void)
   }
 
   return -1;
+}
+
+uint64 sys_setraidmode(void)
+{
+    int mode;
+    argint(0, &mode);
+    if (mode != RAID_MODE_0 && mode != RAID_MODE_1 && mode != RAID_MODE_5)
+        return -1;
+    raid_set_mode(mode);
+    return 0;
+}
+
+uint64 sys_faildisk(void)
+{
+    int disk;
+    argint(0, &disk);
+    if (disk < 0 || disk >= NDISK)
+        return -1;
+    faildisk(disk);
+    return 0;
+}
+
+uint64 sys_recovereddisk(void)
+{
+    int disk;
+    argint(0, &disk);
+    if (disk < 0 || disk >= NDISK)
+        return -1;
+    recovereddisk(disk);
+    return 0;
 }

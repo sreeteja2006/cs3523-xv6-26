@@ -1,0 +1,268 @@
+CS3523: Operating Systems II (Spring 2026)
+IIT Hyderabad, India
+Programming Assignment 04:
+Disk Scheduling and RAID-backed Swap in xv6
+
+Overview
+In PA1, you extended xv6 by implementing new system calls and maintaining per-process system call
+accounting. In PA2, you redesigned the xv6 scheduler and implemented a System-Call-Aware MultiLevel Feedback Queue (SC-MLFQ) scheduler. In PA3, you extended xv6’s virtual memory subsystem
+by implementing page replacement and a swap mechanism using an in-memory array.
+In this assignment, you will extend xv6 further by replacing the in-memory swap mechanism with a
+disk-backed swap system, and by implementing disk scheduling policies and RAID-based storage.
+Instead of storing swapped pages in memory, the kernel must now store them on disk. All swap-in and
+swap-out operations must go through a disk layer that supports scheduling and RAID mapping.
+This assignment builds directly on concepts discussed in class, including:
+Disk structure and access latency
+Disk scheduling policies such as FCFS and SSTF
+RAID techniques such as striping, mirroring, and parity
+Your implementation must also integrate components developed in earlier assignments:
+Virtual memory and swap from PA3
+Scheduling priorities from PA2
+Process statistics from PA1
+
+Before You Begin
+You must use the course xv6 repository for this assignment.
+Clone the repository:
+https://github.com/abhijitcse/cs3523-xv6-26.git
+Ensure that your PA3 implementation compiles and runs correctly before starting PA4.
+You are expected to understand the following xv6 files:
+Kernel-space files:
+kernel/vm.c
+kernel/trap.c
+
+kernel/kalloc.c
+kernel/virtio_disk.c
+kernel/bio.c
+kernel/proc.c
+kernel/proc.h
+You should understand:
+•
+•
+•
+•
+
+how swap was implemented in PA3
+how disk I/O is handled in xv6
+how requests reach the disk driver
+how scheduling metadata is stored in struct proc (from PA2)
+
+Assignment Goal
+Extend xv6 so that:
+1.
+2.
+3.
+4.
+
+Swap is implemented using disk storage instead of memory.
+Disk requests are scheduled using configurable disk scheduling policies.
+Swap blocks are mapped onto multiple disks using RAID techniques.
+The kernel maintains statistics for disk activity and swap operations.
+
+Memory System Behaviour
+In PA3, swap space was implemented using an in-memory array.
+When a page was evicted:
+•
+•
+
+the contents were copied into memory
+the page could later be restored from this array
+
+In this assignment, you will modify this behaviour so that:
+•
+•
+•
+
+the contents of evicted pages are written to disk
+swap-in operations read data from disk
+all swap activity generates disk I/O requests
+
+Disk-backed Swap
+You must replace the in-memory swap mechanism with a disk-backed implementation.
+When a page is evicted:
+•
+
+it must be written to disk blocks
+
+When a page is accessed again:
+
+•
+
+it must be read from disk
+
+Each swapped page must correspond to one or more disk blocks.
+
+Disk Scheduling
+You must implement disk scheduling policies to control the order of disk requests.
+The following policies must be supported:
+•
+•
+
+FCFS
+SSTF
+
+You must maintain a queue of pending disk requests and schedule them according to the selected
+policy. You must provide the following system call:
+int setdisksched(int policy)
+Where:
+•
+•
+
+policy = 0 → FCFS
+policy = 1 → SSTF
+
+Disk Latency Model
+To make scheduling meaningful, you must simulate disk latency.
+The disk is modeled as a sequence of logical blocks.
+For each request, the latency must be computed as:
+latency = |current_block - requested_block| + C
+where:
+•
+
+current_block is the current disk head position
+
+•
+
+requested_block is the target block
+
+•
+
+C is a constant representing rotational delay
+
+The kernel must maintain the current disk head position and update it after each request.
+
+RAID-backed Swap
+You must simulate multiple disks in software and distribute swap data across them using RAID
+techniques.
+RAID Configuration
+The system must simulate 4 disks. All disks are identical and have equal capacity.
+RAID 0 (Striping)
+Data must be distributed across N disks. Logical block b must map to:
+disk = b % N
+block = b / N
+RAID 1 (Mirroring)
+Each block must be written to 2 disks. Reads may be served from any disk.
+RAID 5 (Striping with Parity)
+Data must be striped across N disks along with parity blocks. Parity must be computed using XOR
+over data blocks. Parity must be distributed across disks using the rule:
+parity_disk = block_number % N
+On read:
+•
+
+data must be reconstructed if one disk is unavailable or data is missing
+
+On write:
+•
+
+parity must be updated correctly
+
+Swap and RAID Interaction
+When a page is swapped out:
+•
+•
+
+the page must be written to disk using the RAID mapping
+multiple disk requests may be generated
+
+When a page is swapped in:
+•
+•
+
+the page must be read from the appropriate disk(s)
+data must be reconstructed when required (RAID 5)
+
+Scheduler-Aware Disk Scheduling (Integration with PA2)
+Disk scheduling must consider process priority.
+If multiple disk requests are pending:
+•
+
+requests from higher priority processes should be preferred when applicable
+
+Kernel Statistics (Integration with PA1)
+Extend your statistics system to include:
+disk_reads
+disk_writes
+avg_disk_latency
+These statistics must be maintained by the kernel and made available through your existing system call
+interface.
+
+Required Kernel Modifications
+Your implementation will primarily involve modifying the following files:
+kernel/vm.c
+kernel/trap.c
+kernel/virtio_disk.c
+kernel/bio.c
+kernel/proc.c
+
+You will need to:
+•
+•
+•
+•
+•
+•
+
+replace the in-memory swap mechanism
+implement disk-backed swap operations
+maintain a disk request queue
+implement disk scheduling policies
+implement RAID mapping and parity handling
+update statistics
+
+Experimental Evaluation
+You must write user programs that demonstrate the behaviour of your implementation. Your
+experiments should include:
+•
+•
+•
+•
+
+triggering swap operations
+observing disk scheduling behaviour
+comparing FCFS and SSTF performance
+verifying RAID mappings
+
+•
+•
+
+demonstrating correctness of swap-in and swap-out
+verifying correct behaviour under RAID 5 reconstruction
+
+Example workload:
+Allocate large memory region
+Trigger page faults
+Observe disk activity and scheduling behaviour
+Include a short experimental analysis (1-2 pages) in your README.
+
+Submission Requirements and Deadline
+Each submission must include:
+•
+•
+•
+
+Modified xv6 kernel source files
+User-space test programs
+A short README describing:
+o Implemented features
+o Design decisions and assumptions
+o Experimental results
+
+All files must be packaged into a single ZIP archive and submitted through Moodle. The ZIP file
+should contain only the necessary source files and documentation. Do not include compiled binaries
+or QEMU build artifacts.
+The submission deadline for this assignment is:
+Wednesday, April 22, 23:59:59 IST
+Late submissions will not be considered for evaluation.
+
+Evaluation Criteria
+• Correct disk-backed swap implementation: 25%
+• Correct disk scheduling implementation: 20%
+• Correct RAID implementation (including RAID 5): 20%
+• Integration with virtual memory system: 15%
+• Experimental validation: 15%
+• Code quality and locking discipline: 5%
+
+Academic Integrity
+This is an individual assignment. Students may discuss ideas but must write and submit their own
+code. Any form of code sharing will be treated as a violation of academic integrity policies.
+
+

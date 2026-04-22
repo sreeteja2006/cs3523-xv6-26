@@ -52,16 +52,13 @@ static void
 priority_boost(void)
 {
   struct proc *p;
-
   for (p = proc; p < &proc[NPROC]; p++)
   {
-    acquire(&p->lock);
-    if ((p->state == RUNNABLE || p->state == RUNNING || p->state == SLEEPING) && p->level != 0)
+    if (p->state == RUNNABLE || p->state == RUNNING || p->state == SLEEPING)
     {
       p->level = 0;
       p->qticks = 0;
     }
-    release(&p->lock);
   }
 }
 void trapinit(void)

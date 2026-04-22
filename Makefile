@@ -28,7 +28,9 @@ OBJS = \
   $K/sysfile.o \
   $K/kernelvec.o \
   $K/plic.o \
-  $K/virtio_disk.o
+  $K/virtio_disk.o \
+  $K/disksched.o \
+  $K/raid.o 
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
 # perhaps in /opt/riscv/bin
@@ -171,13 +173,17 @@ UPROGS=\
 	$U/_L\
 	$U/_M\
 	$U/_N\
-
-	
-	
+	$U/_O\
+	$U/_P\
+	$U/_Q\
+	$U/_R\
+  	$U/_S\
+	$U/_T
 
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
+	dd if=/dev/zero bs=1024 count=120000 >> fs.img
 
 -include kernel/*.d user/*.d
 
